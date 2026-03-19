@@ -13,6 +13,7 @@ class CasualSelfAttention(nn.Module):
         assert config.n_embd % config.n_head == 0
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -46,6 +47,8 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
+
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -65,6 +68,35 @@ class Block(nn.Module):
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
+
+
+import tiktoken
+
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+
+        with open('input.txt', 'r') as f:
+            file = f.read()
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(file)
+        self.tokens = torch.tensor(tokens)
+        print(f"Loaded {len(self.tokens)} tokens")
+        print(f"1 epoche = {len(self.tokens) // (B * T)} batches")
+
+        self.current_position = 0
+
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position : self.current_position +  B * T +1]
+        x = (buf[:-1]).view(B, T)
+        y = (buf[1:]).view(B, T)
+        self.current_position += B * T
+        if self.current_position + (B * T + 1) < len(self.tokens):
+            self.current_position = 0
+        return x, y
 
 
 @dataclass
@@ -89,6 +121,21 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        self.transformer.wte.weight = self.lm_head.weight
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                std = (2 * self.config.n_layer) ** -0.5 * std
+            torch.nn.init.normal_(module.weight, mean=0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0, std=0.02)
 
     def forward(self, idx, targets=None):
         B, T = idx.size()
@@ -158,36 +205,20 @@ class GPT(nn.Module):
         return model
 
 
-
-max_return_sequence = 5
-max_length = 30
-
-
-
-
-import tiktoken
-enc = tiktoken.get_encoding('gpt2')
-with open("input.txt", "r") as f:
-    text = f.read()
-text = text[:1000]
-tokens = enc.encode(text)
-B, T = 4, 32
-buf = torch.tensor(tokens[:B * T + 1])
-x = buf[:-1].view(B, T)
-y = buf[1:].view(B, T)
-
 model = GPT(GPTConfig())
 model.to('cuda')
-model.eval()
 
-x = x.to('cuda')
-y = y.to('cuda')
+train_loader = DataLoaderLite(B = 4, T = 32)
 
-#so the target is getted by the y which is the tokens shitted by one whihc will tell the model
-# next token is like this so the target is this predict the next target by the target I am giving you
-logits, loss = model(x, y)
-
-print(loss)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    x, y = train_loader.next_batch()
+    x, y = x.to('cuda'), y.to('cuda')
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f"step {i}, loss: {loss.item()}")
 
 
 
