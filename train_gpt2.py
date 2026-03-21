@@ -204,21 +204,33 @@ class GPT(nn.Module):
 
         return model
 
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+
+train_loader = DataLoaderLite(B = 4, T = 32)
+
+torch.set_float32_matmul_precision('high')
+
 
 model = GPT(GPTConfig())
 model.to('cuda')
 
-train_loader = DataLoaderLite(B = 4, T = 32)
+import time
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
+    t = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to('cuda'), y.to('cuda')
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+        logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
-    print(f"step {i}, loss: {loss.item()}")
+    torch.cuda.synchronize()
+    t = time.time() - t
+    print(f"step {i}, loss: {loss.item()}, time: {t}")
 
 
 
