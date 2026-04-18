@@ -7,6 +7,8 @@ from transformers import GPT2Config
 import math
 
 
+device = "cpu"
+
 class CasualSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -235,7 +237,7 @@ torch.set_float32_matmul_precision('high')
 
 
 model = GPT(GPTConfig())
-model.to('cuda')
+model.to(device)
 
 import time
 
@@ -257,9 +259,9 @@ optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, dev
 for step in range(max_step):
     t = time.time()
     x, y = train_loader.next_batch()
-    x, y = x.to('cuda'), y.to('cuda')
+    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
         logits, loss = model(x, y)
     loss.backward()
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
