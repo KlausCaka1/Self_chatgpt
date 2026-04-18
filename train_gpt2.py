@@ -1,3 +1,4 @@
+import inspect
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
@@ -29,10 +30,11 @@ class CasualSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:, : ,  :T , :T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        y = att @ v
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:, : ,  :T , :T] == 0, float('-inf'))
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
         # y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
@@ -102,7 +104,7 @@ class DataLoaderLite:
 @dataclass
 class GPTConfig:
     block_size: int = 1024
-    vocab_size: int = 50257
+    vocab_size: int = 50304
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
@@ -204,6 +206,25 @@ class GPT(nn.Module):
 
         return model
 
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items()}
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        non_decay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_group = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': non_decay_params, 'weight_decay': 0.0},
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_non_decay_params = sum(p.numel() for p in non_decay_params)
+        print(f"total number of decay parameters{num_decay_params}")
+        print(f"total number of non-decay parameters{num_non_decay_params}")
+        fused_aviable = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        used_fused = fused_aviable and 'cude' in device
+        optimizer = torch.optim.AdamW(optim_group, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, weight_decay=weight_decay)
+        return optimizer
+
+
 torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
@@ -218,8 +239,22 @@ model.to('cuda')
 
 import time
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_step = 10
+max_step = 50
+def get_lr(it):
+    if it < warmup_step:
+        return max_lr * (it + 1) / warmup_step
+    if it > max_step:
+        return min_lr
+    decay_ratio = (it-warmup_step)/(max_step-warmup_step)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return max_lr * coeff * (max_lr - min_lr)
+
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device='cuda')
+for step in range(max_step):
     t = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to('cuda'), y.to('cuda')
@@ -227,10 +262,14 @@ for i in range(50):
     with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
         logits, loss = model(x, y)
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
     optimizer.step()
     torch.cuda.synchronize()
     t = time.time() - t
-    print(f"step {i}, loss: {loss.item()}, time: {t}")
+    print(f"step {step}, loss: {loss.item()}, time: {t}")
 
 
 
