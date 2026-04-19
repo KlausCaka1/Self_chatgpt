@@ -7,7 +7,7 @@ from transformers import GPT2Config
 import math
 
 
-device = "cpu"
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
 class CasualSelfAttention(nn.Module):
 
@@ -231,7 +231,16 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-train_loader = DataLoaderLite(B = 4, T = 32)
+
+total_batch_size = 524288
+B = 16
+T = 1024
+assert total_batch_size % (B * T)== 0
+grad_accum_steps =  total_batch_size // (B * T)
+print(f"total disered batch size: {total_batch_size}")
+print(f"total number of accumlated steps: {grad_accum_steps}")
+
+train_loader = DataLoaderLite(B = B, T = T)
 
 torch.set_float32_matmul_precision('high')
 
@@ -258,20 +267,27 @@ def get_lr(it):
 optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device='cuda')
 for step in range(max_step):
     t = time.time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(x, y)
-    loss.backward()
+    loss_accum = 0
+    for micro_steps in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        loss.backward()
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     optimizer.step()
     torch.cuda.synchronize()
+    dt = time.time() - t
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
+    tokens_per_sec = tokens_processed / dt
     t = time.time() - t
-    print(f"step {step}, loss: {loss.item()}, time: {t}")
+    print(f"step {step}, loss: {loss_accum.item()}, time: {t}")
 
 
 
